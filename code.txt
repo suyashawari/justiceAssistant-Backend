@@ -29,6 +29,7 @@ justiceassist/
 │       └── translate_utils.py
 ├── celery_worker.py
 ├── combine.js
+├── maintenance.flag
 ├── manual_test.py
 ├── README.md
 ├── requirements.txt
@@ -66,9 +67,20 @@ from app.models import db
 from sqlalchemy import func
 from datetime import datetime, timedelta
 import traceback
+import os
 admin_bp = Blueprint("admin", __name__)
+MAINTENANCE_FLAG_FILE = 'maintenance.flag'
+def _read_maintenance_status():
+    if os.path.exists(MAINTENANCE_FLAG_FILE):
+        with open(MAINTENANCE_FLAG_FILE, 'r') as f:
+            status = f.read().strip()
+            return status == 'True'
+    return False
+def _write_maintenance_status(status: bool):
+    with open(MAINTENANCE_FLAG_FILE, 'w') as f:
+        f.write(str(status))
 mock_settings_db = {
-    "maintenance_mode": False,
+    "maintenance_mode": _read_maintenance_status(),
     "api_keys": {
         "openai": "sk-...",
         "google_gemini": "AIza...",
@@ -172,7 +184,33 @@ def get_report_analytics():
 @admin_bp.route("/admin/settings", methods=["GET"])
 @admin_required()
 def get_settings():
+    mock_settings_db['maintenance_mode'] = _read_maintenance_status()
     return jsonify(mock_settings_db)
+def prepend_api_key_to_env(env_var_name, new_key):
+    if not new_key:
+        return
+    env_path = '.env'
+    if not os.path.exists(env_path):
+        print(f"Warning: .env file not found at {os.path.abspath(env_path)}")
+        return
+    with open(env_path, 'r') as f:
+        lines = f.readlines()
+    found = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith(env_var_name + "="):
+            parts = line.strip().split('=', 1)
+            current_values = parts[1] if len(parts) > 1 else ""
+            if current_values:
+                new_values = f"{new_key},{current_values}"
+            else:
+                new_values = new_key
+            lines[i] = f"{env_var_name}={new_values}\n"
+            found = True
+            break
+    if not found:
+        lines.append(f"\n{env_var_name}={new_key}\n")
+    with open(env_path, 'w') as f:
+        f.writelines(lines)
 @admin_bp.route("/admin/settings", methods=["POST"])
 @admin_required()
 def update_settings():
@@ -181,13 +219,22 @@ def update_settings():
     if not data:
         return jsonify({"error": "Invalid JSON body"}), 400
     if 'maintenance_mode' in data:
-        mock_settings_db['maintenance_mode'] = bool(data['maintenance_mode'])
+        is_maintenance = bool(data['maintenance_mode'])
+        _write_maintenance_status(is_maintenance)
+        mock_settings_db['maintenance_mode'] = is_maintenance
     if 'api_keys' in data:
-        mock_settings_db['api_keys'].update(data['api_keys'])
+        api_keys = data['api_keys']
+        if api_keys.get('google_gemini') and api_keys['google_gemini'] != mock_settings_db['api_keys']['google_gemini']:
+             prepend_api_key_to_env('GEMINI_API_KEYS', api_keys['google_gemini'])
+        if api_keys.get('openai') and api_keys['openai'] != mock_settings_db['api_keys']['openai']:
+             prepend_api_key_to_env('OPENAI_API_KEY', api_keys['openai'])
+        if api_keys.get('openrouter') and api_keys['openrouter'] != mock_settings_db['api_keys']['openrouter']:
+             prepend_api_key_to_env('OPENROUTER_API_KEY', api_keys['openrouter'])
+        mock_settings_db['api_keys'].update(api_keys)
     if 'report_categories' in data:
         if isinstance(data['report_categories'], list):
             mock_settings_db['report_categories'] = [cat for cat in data['report_categories'] if cat.strip()]
-    return jsonify({"message": "Settings updated successfully", "settings": mock_settings_db})
+    return jsonify({"message": "Settings updated. Server restart may be needed for API key changes to take effect."})
 @admin_bp.route("/admin/users", methods=["GET"])
 @admin_required()
 def get_all_users():
@@ -457,6 +504,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from redis import Redis
 from rq import Queue
 from app.tasks import analyze_report_task
+from app.api.admin_routes import mock_settings_db
 main = Blueprint('main', __name__)
 redis_url = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
 try:
@@ -562,6 +610,10 @@ def update_report(report_id):
         db.session.rollback()
         return jsonify({"error": "Failed to update report", "details": str(e)}), 500
     return jsonify({"message": "Report updated", "report": report.to_dict()}), 200
+@main.route('/api/maintenance-status', methods=['GET'])
+def get_maintenance_status():
+    is_maintenance = mock_settings_db.get('maintenance_mode', False)
+    return jsonify({"maintenance_mode": is_maintenance})
 
 
 
@@ -2156,6 +2208,13 @@ combineFiles();
 
 
 
+==================== maintenance.flag ====================
+
+True
+
+
+
+
 ==================== manual_test.py ====================
 
 import os
@@ -2455,6 +2514,7 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("  Diagnostic complete.")
     print("="*60)
+
 
 
 
@@ -9472,6 +9532,19 @@ const ReportForm = () => {
   const [searchParams] = useSearchParams();
   const [isJsonPanelVisible, setIsJsonPanelVisible] = useState(false);
   const [jsonInput, setJsonInput] = useState('');
+  const [isMaintenanceMode, setIsMaintenanceMode] = useState(false);
+
+  useEffect(() => {
+    const fetchMaintenanceStatus = async () => {
+      try {
+        const response = await axios.get(`${process.env.REACT_APP_API_URL}/api/maintenance-status`);
+        setIsMaintenanceMode(response.data.maintenance_mode);
+      } catch (error) {
+        console.error("Could not fetch maintenance status:", error);
+        setIsMaintenanceMode(false);       }
+    };
+    fetchMaintenanceStatus();
+  }, []);
 
   useEffect(() => {
     const category = searchParams.get('category');
@@ -9628,10 +9701,11 @@ const ReportForm = () => {
 
   return (
     <div className="report-container">
-      {}
-      <button className="json-import-btn" onClick={() => setIsJsonPanelVisible(true)}>
-        <FaCode /> Import JSON
-      </button>
+      {isMaintenanceMode && (
+        <button className="json-import-btn" onClick={() => setIsJsonPanelVisible(true)}>
+            <FaCode /> Import JSON
+        </button>
+      )}
 
       {isJsonPanelVisible && (
         <div className={`json-panel ${isJsonPanelVisible ? 'open' : ''}`}>
