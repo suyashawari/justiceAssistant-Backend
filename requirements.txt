@@ -63,3 +63,4 @@ langdetect
 tavily-python
 rq
 google-genai
+piexif
