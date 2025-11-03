@@ -55,33 +55,32 @@
 
 
 
+
 import os
 from dotenv import load_dotenv
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS  # Keep the import, but we will call it elsewhere
+from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 from flask_migrate import Migrate
-
 load_dotenv()
 db = SQLAlchemy()
 jwt = JWTManager()
 migrate = Migrate()
-
 def create_app():
     app = Flask(__name__, instance_relative_config=False)
+
+    # --- ADDED: Centralized CORS Configuration for the entire app ---
+    # This single line handles CORS for all routes and blueprints.
+    CORS(app, supports_credentials=True)
+    # -----------------------------------------------------------------
+
     app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///dev.db")
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "super-secret-key")
-
     db.init_app(app)
     jwt.init_app(app)
     migrate.init_app(app, db)
-
-    # --- CORS CONFIGURATION HAS BEEN REMOVED FROM THIS FILE ---
-    # We will apply it directly to the blueprints that need it.
-    # This avoids potential conflicts with other extensions or the app factory pattern.
-
     from app.api.main_routes import main as main_blueprint
     from app.api.auth_routes import auth as auth_blueprint
     from app.api.ai_routes import ai as ai_blueprint
@@ -89,14 +88,14 @@ def create_app():
     from app.api.dashboard_route import dashboard
     from app.api.admin_routes import admin_bp
 
-    # Apply CORS to blueprints here for better control
-    CORS(auth_blueprint, supports_credentials=True, origins="*") # Allows credentials from any origin for auth
-    CORS(ai_blueprint, supports_credentials=True, origins="*")
-    CORS(dashboard, supports_credentials=True, origins="*")
-    CORS(main_blueprint, supports_credentials=True, origins="*")
-    CORS(report_blueprint, supports_credentials=True, origins="*")
-    CORS(admin_bp, supports_credentials=True, origins="*")
-
+    # --- REMOVED: All redundant, blueprint-specific CORS lines ---
+    # CORS(auth_blueprint, supports_credentials=True, origins="*")
+    # CORS(ai_blueprint, supports_credentials=True, origins="*")
+    # CORS(dashboard, supports_credentials=True, origins="*")
+    # CORS(main_blueprint, supports_credentials=True, origins="*")
+    # CORS(report_blueprint, supports_credentials=True, origins="*")
+    # CORS(admin_bp, supports_credentials=True, origins="*")
+    # -------------------------------------------------------------
 
     app.register_blueprint(main_blueprint)
     app.register_blueprint(auth_blueprint, url_prefix="/auth")
@@ -104,5 +103,4 @@ def create_app():
     app.register_blueprint(ai_blueprint, url_prefix="/ai")
     app.register_blueprint(dashboard)
     app.register_blueprint(admin_bp, url_prefix="/api")
-
     return app

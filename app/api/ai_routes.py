@@ -175,7 +175,7 @@ from app.utils.suspect_utils import analyze_evidence
 load_dotenv()
 
 # --- MODIFIED: Use OpenRouter configuration ---
-openrouter_key = os.getenv("OPENROUTER_API_KEY2")
+openrouter_key = os.getenv("OPENROUTER_API_KEY")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Using a capable and free model available on OpenRouter
 MODEL = "openai/gpt-oss-20b:free"

@@ -16,6 +16,7 @@ justiceassist/
 │       ├── __init__.py
 │       ├── classifier.py
 │       ├── decorators.py
+│       ├── gemini_agent.py
 │       ├── gemini_helper.py
 │       ├── legal_references.py
 │       ├── multilingual.py
@@ -31,6 +32,7 @@ justiceassist/
 ├── requirements.txt
 ├── run.py
 ├── temp.py
+├── tempWEB.py
 ├── test_redis_celery.py
 
 
@@ -226,20 +228,16 @@ def delete_user(user_id):
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 import os
+import requests
 from dotenv import load_dotenv
-import google.generativeai as genai
-import openai
 from app.models import db
 from app.models.models import Report
 from werkzeug.utils import secure_filename
 from app.utils.suspect_utils import analyze_evidence
 load_dotenv()
-gemini_key = os.getenv("GOOGLE_API_KEY")
-openai_key = os.getenv("OPENAI_API_KEY")
-if gemini_key:
-    genai.configure(api_key=gemini_key)
-if openai_key:
-    openai.api_key = openai_key
+openrouter_key = os.getenv("OPENROUTER_API_KEY")
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "openai/gpt-oss-20b:free"
 ai = Blueprint('ai', __name__)
 UPLOAD_FOLDER = "uploads"
 @ai.route('/get-guidance', methods=['POST'])
@@ -249,41 +247,49 @@ def get_guidance():
     user_query = data.get("query", "")
     if not user_query:
         return jsonify({"status": "error", "error": "Query is required"}), 400
-    if gemini_key:
-        try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(prompt)
-            guidance_text = getattr(response, "text", None)
-            if not guidance_text and hasattr(response, "candidates"):
-                guidance_text = response.candidates[0].content.parts[0].text
-            if guidance_text:
-                return jsonify({
-                    "status": "success",
-                    "provider": "Gemini",
-                    "guidance": guidance_text
-                }), 200
-        except Exception as e:
-            print(f"Gemini failed: {e}")
-    if openai_key:
-        try:
-            completion = openai.ChatCompletion.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful cybercrime reporting assistant."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            guidance_text = completion.choices[0].message["content"]
-            return jsonify({
-                "status": "success",
-                "provider": "OpenAI",
-                "guidance": guidance_text
-            }), 200
-        except Exception as e:
-            print(f"OpenAI failed: {e}")
+    prompt = (
+        "You are an expert Indian cybercrime legal assistant. "
+        "Based on the following user query, provide clear, concise, and actionable guidance. "
+        "Explain the type of cybercrime, immediate steps the user should take, "
+        "what evidence to collect, and which sections of Indian law might apply. "
+        "Keep the tone helpful and reassuring.\n\n"
+        f"User Query: \"{user_query}\""
+    )
+    if not openrouter_key:
+        print("ERROR: OPENROUTER_API_KEY not found in .env file.")
+        return jsonify({
+            "status": "error",
+            "error": "AI service is not configured correctly on the server."
+        }), 500
+    try:
+        headers = {
+            "Authorization": f"Bearer {openrouter_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=90)
+        response.raise_for_status()
+        response_data = response.json()
+        guidance_text = response_data['choices'][0]['message']['content']
+        return jsonify({
+            "status": "success",
+            "provider": f"OpenRouter ({MODEL})",
+            "guidance": guidance_text
+        }), 200
+    except requests.exceptions.RequestException as e:
+        print(f"OpenRouter API request failed: {e}")
+        if e.response and e.response.status_code in [401, 403]:
+            return jsonify({"status": "error", "error": "AI service authentication failed. Check server API key."}), 500
+    except Exception as e:
+        print(f"An error occurred while processing the OpenRouter response: {e}")
     return jsonify({
         "status": "error",
-        "error": "Both Gemini and OpenAI services failed. Please try again later."
+        "error": "The AI guidance service failed. Please try again later."
     }), 500
 @ai.route('/guess-suspect', methods=['POST'])
 @jwt_required()
@@ -639,13 +645,13 @@ jwt = JWTManager()
 migrate = Migrate()
 def create_app():
     app = Flask(__name__, instance_relative_config=False)
+    CORS(app, supports_credentials=True)
     app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///dev.db")
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "super-secret-key")
     db.init_app(app)
     jwt.init_app(app)
     migrate.init_app(app, db)
-    CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
     from app.api.main_routes import main as main_blueprint
     from app.api.auth_routes import auth as auth_blueprint
     from app.api.ai_routes import ai as ai_blueprint
@@ -743,7 +749,7 @@ class User(db.Model):
 
 ==================== app/tasks.py ====================
 
-from app.utils.openrouter_agent import run_analysis_agent
+from app.utils.gemini_agent import run_analysis_agent
 from datetime import datetime
 import json
 def analyze_report_task(report_id):
@@ -765,7 +771,7 @@ def analyze_report_task(report_id):
             report.status = 'analyzing'
             db.session.commit()
             raw_findings = run_analysis_agent(
-                text_to_analyze=report.description,
+                text_to_analyze=report_context,
                 report_id=report.id,
                 file_path=report.evidence_file
             )
@@ -776,10 +782,11 @@ def analyze_report_task(report_id):
                 db.session.commit()
                 return
             indicators_of_compromise = {}
-            for tool_run in raw_findings.get("tool_results", []):
+            for tool_run in reversed(raw_findings.get("tool_results", [])):
                 if tool_run.get("tool") == "extract_artifacts":
                     indicators_of_compromise = tool_run.get("output", {})
                     break
+            final_summary_text = raw_findings.get("final_summary_text", "Analysis complete.")
             incident_type = report.complaint_category or "Unknown"
             suspect_profile = "A suspect involved in online malicious activities."
             if "crypto" in incident_type.lower():
@@ -787,7 +794,7 @@ def analyze_report_task(report_id):
             elif "phishing" in incident_type.lower() or "email" in incident_type.lower():
                 suspect_profile = "Scammer using deceptive emails/websites to steal credentials."
             executive_summary = {
-                "summary": raw_findings.get("final_summary_text", "Analysis complete.").strip(),
+                "summary": final_summary_text.strip(),
                 "suspect_profile": suspect_profile,
                 "incident_type": incident_type
             }
@@ -950,23 +957,200 @@ def admin_required():
 
 
 
+==================== app/utils/gemini_agent.py ====================
+
+import os
+from dotenv import load_dotenv
+load_dotenv()
+import json
+import requests
+import time
+import random
+import re
+import traceback
+from app.utils.suspect_utils import TOOL_REGISTRY
+GEMINI_API_KEYS = [key.strip() for key in os.getenv("GEMINI_API_KEYS", "").split(",") if key.strip()]
+if not GEMINI_API_KEYS and os.getenv("GOOGLE_API_KEY"):
+    GEMINI_API_KEYS = [os.getenv("GOOGLE_API_KEY")]
+API_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+MODEL = "gemini-flash-latest"
+MAX_TURNS = 10
+def clean_and_parse_json(text: str):
+    if not text: return {}
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text.lstrip("```json").rstrip("```")
+    elif text.startswith("```"):
+        text = text.lstrip("```").rstrip("```")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except:
+                pass
+    return {"purpose": "error", "error_message": "AI returned malformed JSON."}
+def chat_with_gemini(messages, current_key_index, temperature: float = 0.2, timeout: int = 90, max_retries: int = 3):
+    if not GEMINI_API_KEYS:
+        print("❌ [AGENT ERROR] No Gemini API keys configured.")
+        return {"purpose": "error", "error_message": "AI service is not configured."}, current_key_index
+    local_key_index = current_key_index
+    for attempt in range(max_retries):
+        current_key = GEMINI_API_KEYS[local_key_index % len(GEMINI_API_KEYS)]
+        url = f"{API_URL_BASE}?key={current_key}"
+        system_instruction = None
+        content_for_api = []
+        for m in messages:
+            if m['role'] == 'system':
+                system_instruction = m['content']
+            else:
+                role = 'model' if m['role'] in ['assistant', 'model'] else 'user'
+                content_for_api.append({'role': role, 'parts': [{'text': m['content']}]})
+        payload = {
+            "contents": content_for_api,
+            "system_instruction": {'parts': [{'text': system_instruction}]},
+            "generation_config": {
+                "temperature": temperature,
+            }
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=timeout)
+            if 200 <= r.status_code < 300:
+                response_data = r.json()
+                ai_response_text = response_data['candidates'][0]['content']['parts'][0]['text']
+                return clean_and_parse_json(ai_response_text), local_key_index
+            if r.status_code in [401, 403, 429]:
+                print(f"🚫 Key failed with status {r.status_code}. Rotating key.")
+                local_key_index += 1
+                time.sleep(1 + random.random())
+                continue
+            if 500 <= r.status_code < 600:
+                print(f"⚠️ Server error {r.status_code}. Retrying...")
+                time.sleep(1.5 ** attempt)
+                continue
+            print(f"❌ Unhandled status {r.status_code}. Failing. Response: {r.text}")
+            return {"purpose": "error", "error_message": f"API failed with status {r.status_code}"}, local_key_index
+        except requests.exceptions.RequestException as e:
+            print(f"Network error: {e}. Retrying...")
+            time.sleep(1.5 ** attempt)
+        except Exception as e:
+            print(f"General error: {e}. Failing.")
+            return {"purpose": "error", "error_message": str(e)}, local_key_index
+    return {"purpose": "error", "error_message": "All API keys failed or retries exhausted."}, local_key_index
+def run_analysis_agent(text_to_analyze: str, report_id: int, file_path: str = None):
+    current_key_index = 0
+    findings = {
+        "tool_results": [],
+        "final_summary_text": "Investigation Inconclusive: Agent failed to return a final summary.",
+        "errors": []
+    }
+    SYSTEM_PROMPT = (
+        "You are an autonomous Cyber Investigator. Your goal is to provide a comprehensive, evidence-backed summary of the cybercrime incident."
+        "Your responses MUST be a single, valid JSON object with the following structure:\n"
+        "1. **`purpose`**: [\"extract_artifacts\", \"inspect_urls\", \"inspect_ips\", \"web_search\", \"summarize_findings\", \"stop_investigation\", \"error\"]\n"
+        "2. **`parameters`**: {args for the tool, e.g., {\"text\": \"...\"}} (omit if summarizing/stopping)\n"
+        "3. **`final_summary`**: \"Your comprehensive final analysis text.\" (only include if purpose is \"summarize_findings\")\n\n"
+        "RULES:\n"
+        "- Base your decisions ONLY on the evidence and tool results provided in the history.\n"
+        "- Do not call tools with empty data (e.g., inspect_urls with an empty list).\n"
+        f"- Maximum {MAX_TURNS} turns allowed. Use `summarize_findings` to stop the investigation."
+    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"BEGIN ANALYSIS. Full Report Context:\n\n{text_to_analyze}"}
+    ]
+    print(f"\n{'='*60}\nStarting Gemini Stateless Agent for Report ID: {report_id} (Max Turns: {MAX_TURNS})\n{'='*60}")
+    for turn in range(MAX_TURNS):
+        print(f"\n--- Agent Turn {turn + 1} / {MAX_TURNS} ---")
+        ai_response_json, new_key_index = chat_with_gemini(messages, current_key_index)
+        current_key_index = new_key_index
+        messages.append({"role": "model", "content": json.dumps(ai_response_json)})
+        purpose = ai_response_json.get("purpose", "error")
+        parameters = ai_response_json.get("parameters", {})
+        if purpose == "summarize_findings":
+            findings["final_summary_text"] = ai_response_json.get("final_summary", "Agent finished with a successful summary.")
+            print("[AGENT LOG] Final summary received. Investigation complete.")
+            return findings
+        if purpose == "stop_investigation":
+            findings["final_summary_text"] = "Agent explicitly stopped the investigation due to a dead end."
+            print("[AGENT LOG] Agent explicitly stopped. Investigation complete.")
+            return findings
+        if purpose == "error" or purpose not in TOOL_REGISTRY:
+            error_msg = ai_response_json.get("error_message", f"AI returned an unhandled error or unknown purpose: {purpose}")
+            findings["errors"].append(error_msg)
+            print(f"❌ [AGENT ERROR] {error_msg}")
+            findings["final_summary_text"] = f"Investigation Halted on Turn {turn + 1} due to error: {error_msg}. Finalizing report with partial findings."
+            return findings
+        if purpose in TOOL_REGISTRY:
+            tool_func = TOOL_REGISTRY[purpose]
+            print(f"[AGENT LOG] ✓ Executing tool: `{purpose}` with args: {list(parameters.keys())}")
+            tool_output = None
+            try:
+                tool_output = tool_func(**parameters)
+                findings["tool_results"].append({"tool": purpose, "args": parameters, "output": tool_output})
+                messages.append({
+                    "role": "user",
+                    "content": f"TOOL_OUTPUT_FOR_{purpose}: {json.dumps(tool_output)}"
+                })
+            except Exception as e:
+                error_msg = f"Tool execution failed for {purpose}: {str(e)}"
+                findings["errors"].append(error_msg)
+                messages.append({
+                    "role": "user",
+                    "content": f"TOOL_EXECUTION_ERROR_FOR_{purpose}: {error_msg}"
+                })
+                print(f"❌ [TOOL ERROR] {error_msg}")
+    findings["final_summary_text"] = f"Investigation stopped: Maximum turns ({MAX_TURNS}) reached without a final summary. Finalizing report with partial findings."
+    print(f"⚠️ [AGENT] Reached maximum turns ({MAX_TURNS})")
+    findings['tool_results'] = findings.get('tool_results', [])
+    return findings
+
+
+
+
 ==================== app/utils/gemini_helper.py ====================
 
 import google.generativeai as genai
 import os
-from app.utils.classifier import classify_incident
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
+from app.utils.classifier import classify_text
+from google.genai import types
+client = None
+try:
+    if os.getenv("GOOGLE_API_KEY"):
+        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+except Exception as e:
+    print(f"Error initializing Gemini client: {e}")
 def get_guidance(text):
-    category = classify_incident(text)
-    response = model.generate_content(prompt)
-    return {
-        "category": category,
-        "guidance": response.text if response and response.text else "No response"
-    }
+    if not client:
+        return {"category": "Unknown", "guidance": "Gemini AI service is not configured correctly on the server."}
+    prompt = (
+        "You are an expert Indian cybercrime legal assistant. "
+        "Based on the following user query, provide clear, concise, and actionable guidance. "
+        "Explain the type of cybercrime, immediate steps the user should take, "
+        "what evidence to collect, and which sections of Indian law might apply. "
+        "Keep the tone helpful and reassuring.\n\n"
+        f"User Query: \"{text}\""
+    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt],
+        )
+        return {
+            "category": classify_text(text).get("category") if text else "Unknown",
+            "guidance": response.text if response and response.text else "No response"
+        }
+    except Exception as e:
+        print(f"Gemini guidance error: {e}")
+        return {
+            "category": "Unknown",
+            "guidance": f"The AI guidance service failed: {str(e)}"
+        }
 def guess_suspect(text):
-    response = model.generate_content(prompt)
-    return response.text if response and response.text else "No response"
+    response = "The dedicated forensic AI agent is running the analysis in the background using advanced tools. Check the Report Details for the full output."
+    return response if response else "No response"
 
 
 
@@ -1075,225 +1259,7 @@ class Translator:
 
 ==================== app/utils/openrouter_agent.py ====================
 
-import os
-from dotenv import load_dotenv
-load_dotenv()
-import json
-import requests
-import time
-import random
-import re
-from datetime import datetime
-from app.utils.suspect_utils import extract_artifacts, inspect_urls, inspect_ips
-API_KEYS_STRING = os.getenv("OPENROUTER_API_KEY", "")
-API_KEYS = [key.strip() for key in API_KEYS_STRING.split(",") if key.strip()]
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openai/gpt-oss-20b:free"
-TOOL_REGISTRY = {
-    "extract_artifacts": extract_artifacts,
-    "inspect_urls": inspect_urls,
-    "inspect_ips": inspect_ips,
-}
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "extract_artifacts",
-            "description": "Extracts digital artifacts (emails, URLs, IPs) from text. Only call this if you need to find emails, URLs, or IP addresses in the provided text.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "The text to extract artifacts from"}
-                },
-                "required": ["text"]
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "inspect_urls",
-            "description": "Performs DNS and WHOIS lookups on URLs. Only call this if you have specific URLs that need investigation. Do not call if no URLs are available.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "urls": {"type": "array", "items": {"type": "string"}, "description": "List of URLs to investigate"}
-                },
-                "required": ["urls"]
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "inspect_ips",
-            "description": "Performs RDAP lookups on IP addresses. Only call this if you have specific IP addresses that need investigation. Do not call if no IPs are available.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ips": {"type": "array", "items": {"type": "string"}, "description": "List of IP addresses to investigate"}
-                },
-                "required": ["ips"]
-            },
-        },
-    },
-]
-def clean_and_parse_json(text: str):
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    text = text.strip()
-    text = re.sub(r'""([^"]+)""', r'"\1"', text)
-    json_match = re.search(r'\{.*\}', text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(0))
-        except json.JSONDecodeError:
-            pass
-    print(f"⚠️ JSON parse failed even after cleaning: {text[:200]}")
-    return {}
-def chat_with_openrouter(messages, current_key_index, temperature: float = 0.2, timeout: int = 90, max_retries: int = 3):
-    if not API_KEYS:
-        print("❌ [AGENT ERROR] No OpenRouter API keys configured in .env file.")
-        return None, current_key_index
-    local_key_index = current_key_index
-    while local_key_index < len(API_KEYS):
-        current_key = API_KEYS[local_key_index]
-        headers = {"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "tools": TOOLS_SCHEMA,
-            "tool_choice": "auto"
-        }
-        should_try_next_key = False
-        for attempt in range(max_retries):
-            try:
-                print(f"[AGENT LOG] Sending request (API key #{local_key_index + 1}, attempt {attempt + 1})...")
-                r = requests.post(API_URL, headers=headers, json=payload, timeout=timeout)
-                if 200 <= r.status_code < 300:
-                    return r.json(), local_key_index
-                if r.status_code in [401, 403, 429]:
-                    print(f"🚫 Key #{local_key_index + 1} failed with status {r.status_code}. Trying next key.")
-                    should_try_next_key = True
-                    break
-                if r.status_code == 400:
-                    print(f"❌ Bad request (400). This is a prompt/model issue, not a key issue. Failing.")
-                    print(f"   Response: {r.text[:500]}")
-                    return None, local_key_index
-                if 500 <= r.status_code < 600:
-                    print(f"⚠️ Server error {r.status_code}. Retrying with same key...")
-                    time.sleep(1.5 ** attempt)
-                    continue
-                print(f"❌ Unhandled status {r.status_code}. Failing.")
-                return None, local_key_index
-            except requests.RequestException as e:
-                print(f"⚠️ Network error: {e}. Retrying...")
-                if attempt + 1 >= max_retries:
-                    should_try_next_key = True
-                    break
-                time.sleep(1.5 ** attempt)
-        if should_try_next_key:
-            local_key_index += 1
-        else:
-            break
-    print("❌ All API keys and retries have been exhausted.")
-    return None, local_key_index
-def execute_tool(function_name: str, function_args: dict):
-    if function_name not in TOOL_REGISTRY:
-        return {"error": f"Unknown function '{function_name}'"}
-    if isinstance(function_args, str):
-        function_args = clean_and_parse_json(function_args)
-        if not function_args:
-            return {"error": "Could not parse arguments"}
-    if function_name == "inspect_ips":
-        if not function_args.get("ips"):
-            print(f"⚠️ [AGENT] Skipping `{function_name}` - no IPs provided")
-            return None
-    elif function_name == "inspect_urls":
-        if not function_args.get("urls"):
-            print(f"⚠️ [AGENT] Skipping `{function_name}` - no URLs provided")
-            return None
-    elif function_name == "extract_artifacts":
-        if not function_args.get("text"):
-            print(f"⚠️ [AGENT] Skipping `{function_name}` - no text provided")
-            return None
-    print(f"[AGENT LOG] ✓ Executing tool: `{function_name}`")
-    try:
-        return TOOL_REGISTRY[function_name](**function_args)
-    except Exception as e:
-        print(f"❌ [AGENT ERROR] Tool execution failed: {e}")
-        return {"error": str(e)}
-def run_analysis_agent(text_to_analyze: str, report_id: int, file_path: str = None, max_turns: int = 4):
-    current_key_index = 0
-    findings = {
-        "tool_results": [],
-        "final_summary_text": "Analysis could not be completed.",
-        "conversation_history": [],
-        "errors": []
-    }
-    system_prompt = (
-        "You are a forensic investigation agent. Your goal is to provide a final summary. Follow these steps strictly:\n"
-        "1. **Analyze the Report:** Read the initial forensic report carefully.\n"
-        "2. **Gather Evidence (ONE TIME ONLY):** Call the necessary tools (`extract_artifacts`, `inspect_urls`, `inspect_ips`) to gather initial evidence. Call all relevant tools in a single turn if possible.\n"
-        "3. **Synthesize and Summarize:** Once you receive output from the tools, your task is to synthesize this information. **DO NOT call the same tools again.** Your final response must be a clear, detailed summary of the findings, explaining what the evidence means."
-    )
-    user_prompt = f"Analyze this forensic report (Report ID: {report_id}):\n\n{text_to_analyze}"
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-    print(f"\n{'='*60}\nStarting Forensic Analysis for Report ID: {report_id} with {len(API_KEYS)} API key(s) available\n{'='*60}")
-    for turn in range(max_turns):
-        print(f"\n--- Agent Turn {turn + 1} ---")
-        response, new_key_index = chat_with_openrouter(messages, current_key_index)
-        current_key_index = new_key_index
-        if not response:
-            error_msg = "Failed to get response from AI after all retries and key rotations."
-            findings["errors"].append(error_msg)
-            findings["final_summary_text"] = error_msg
-            return findings
-        message = response.get("choices", [{}])[0].get("message", {})
-        tool_calls = message.get("tool_calls", [])
-        if tool_calls:
-            print(f"[AGENT LOG] AI requested {len(tool_calls)} tool call(s)")
-            messages.append(message)
-            findings["conversation_history"].append(message)
-            for tool_call in tool_calls:
-                func_name = tool_call.get("function", {}).get("name")
-                func_args_raw = tool_call.get("function", {}).get("arguments", {})
-                tool_call_id = tool_call.get("id", f"call_{turn}_{random.randint(1000,9999)}")
-                func_args = clean_and_parse_json(func_args_raw) if isinstance(func_args_raw, str) else func_args_raw
-                print(f"  → Tool requested: {func_name}")
-                tool_output = execute_tool(func_name, func_args)
-                tool_message_content = json.dumps({"skipped": True, "reason": "Required data not provided."}) if tool_output is None else json.dumps(tool_output)
-                tool_message = {"role": "tool", "tool_call_id": tool_call_id, "name": func_name, "content": tool_message_content}
-                if tool_output is not None:
-                    findings["tool_results"].append({"turn": turn + 1, "tool": func_name, "args": func_args, "output": tool_output})
-                    print(f"  ✅ Executed successfully")
-                else:
-                    print(f"  ⊘ Skipped (insufficient data)")
-                messages.append(tool_message)
-                findings["conversation_history"].append(tool_message)
-            instructional_message = {
-                "role": "user",
-                "content": "You have received the results from your tool calls. Now, provide a comprehensive final summary based on all the information you have gathered. Do not call any more tools."
-            }
-            messages.append(instructional_message)
-            findings["conversation_history"].append(instructional_message)
-            print("[AGENT LOG] Injected instruction to force summarization.")
-        else:
-            print("[AGENT LOG] AI provided final analysis")
-            messages.append(message)
-            findings["conversation_history"].append(message)
-            content = message.get("content", "")
-            findings["final_summary_text"] = content.strip() if content else "Analysis completed."
-            print(f"\n{'='*60}\nFINAL ANALYSIS SUMMARY:\n{findings['final_summary_text'][:500]}\n{'='*60}\n")
-            return findings
-    findings["final_summary_text"] = f"Investigation reached turn limit after {max_turns} turns."
-    print(f"⚠️ [AGENT] Reached maximum turns ({max_turns})")
-    return findings
+
 
 
 
@@ -1423,7 +1389,10 @@ def extract_artifacts(text: str) -> dict:
     print(f"[TOOL RESULT] Found artifacts: {list(artifacts.keys())}")
     return artifacts
 def inspect_urls(urls: list) -> list:
-    print(f"\n[TOOL CALLED] Running `inspect_urls` for {urls}...")
+    print(f"\n[TOOL CALLED] Running `inspect_urls` for {len(urls)} URLs...")
+    if not urls or not isinstance(urls, list):
+        print("[TOOL SKIPPED] No URLs provided or invalid input.")
+        return []
     results = []
     if not isinstance(urls, list): return [{"error": "Input must be a list of URLs."}]
     for url in urls:
@@ -1446,10 +1415,13 @@ def inspect_urls(urls: list) -> list:
         except Exception as e:
             entry["error"] = str(e)
         results.append(entry)
-    print(f"[TOOL RESULT] URL inspection complete.")
+    print(f"[TOOL RESULT] URL inspection complete. {len(results)} records created.")
     return results
 def inspect_ips(ips: list) -> list:
-    print(f"\n[TOOL CALLED] Running `inspect_ips` for {ips}...")
+    print(f"\n[TOOL CALLED] Running `inspect_ips` for {len(ips)} IPs...")
+    if not ips or not isinstance(ips, list):
+        print("[TOOL SKIPPED] No IPs provided or invalid input.")
+        return []
     results = []
     if not isinstance(ips, list): return [{"error": "Input must be a list of IPs."}]
     for ip in ips:
@@ -1462,56 +1434,13 @@ def inspect_ips(ips: list) -> list:
         except Exception as e:
             entry["error"] = str(e)
         results.append(entry)
-    print(f"[TOOL RESULT] IP inspection complete.")
+    print(f"[TOOL RESULT] IP inspection complete. {len(results)} records created.")
     return results
-TOOL_REGISTRY = {
-    "extract_artifacts": extract_artifacts,
-    "inspect_urls": inspect_urls,
-    "inspect_ips": inspect_ips,
-}
-def chat_with_ai(messages):
-    if gemini_model:
-        print("\n[AI TURN] Sending context to Google Gemini...")
-        response = gemini_model.generate_content(messages)
-        return response.text
-    elif openai_client:
-        print("\n[AI TURN] Sending context to OpenAI...")
-        response = openai_client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-        return response.choices[0].message.content
-    else:
-        return json.dumps({"summary": "No AI model available.", "suspect_profile": "Unknown", "evidence_log": ["AI client not configured."]})
-def analyze_evidence(text: str = "", file_path: str = None):
-    print("\n--- [START] New AI-DRIVEN Forensic Analysis ---")
-    SYSTEM_PROMPT = "You are an AI assistant. Analyze the evidence, call tools if needed, and provide a summary."
-    messages = [
-        {"role": "user", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Here is the cybercrime report to analyze:\n\n{text}"}
-    ]
-    for _ in range(5):
-        ai_response_text = chat_with_ai(messages)
-        messages.append({"role": "model", "content": ai_response_text})
-        try:
-            response_json = json.loads(ai_response_text)
-            if "tool_name" in response_json and "arguments" in response_json:
-                tool_name = response_json["tool_name"]
-                args = response_json["arguments"]
-                if tool_name in TOOL_REGISTRY:
-                    tool_function = TOOL_REGISTRY[tool_name]
-                    tool_result = tool_function(**args)
-                    messages.append({"role": "user", "content": f"Tool `{tool_name}` output:\n{json.dumps(tool_result)}"})
-                    continue
-                else:
-                    messages.append({"role": "user", "content": f"Error: Tool '{tool_name}' not found."})
-                    continue
-            print("[AI-DRIVEN] AI has provided a final answer. Analysis complete.")
-            return response_json
-        except (json.JSONDecodeError, TypeError):
-            print("[AI-DRIVEN] AI provided a non-JSON final answer. Wrapping it.")
-            return {"summary": ai_response_text, "suspect_profile": "AI Generated", "evidence_log": ["AI provided a direct text answer."]}
-    print("[AI-DRIVEN] Reached maximum turns. Returning final result.")
-    return {"summary": "Analysis reached maximum turns.", "suspect_profile": "Inconclusive", "evidence_log": messages}
 def web_search(query: str) -> dict:
     print(f"\n[TOOL CALLED] Running `web_search` for query: {query}...")
+    if not query:
+        print("[TOOL SKIPPED] Empty query provided.")
+        return {"results": []}
     try:
         api_key = os.getenv("TAVILY_API_KEY")
         if not api_key:
@@ -1522,6 +1451,31 @@ def web_search(query: str) -> dict:
     except Exception as e:
         print(f"[TOOL ERROR] Tavily search failed: {e}")
         return {"error": str(e)}
+TOOL_REGISTRY = {
+    "extract_artifacts": extract_artifacts,
+    "inspect_urls": inspect_urls,
+    "inspect_ips": inspect_ips,
+    "web_search": web_search,
+}
+def chat_with_ai(messages):
+    pass
+def analyze_evidence(text: str = "", file_path: str = None):
+    from app.utils.gemini_agent import run_analysis_agent
+    print("\n--- [START] AI-DRIVEN Forensic Analysis (Wrapper) ---")
+    context = f"## EVIDENCE DESCRIPTION\n{text}\n## EVIDENCE FILE PATH\n{file_path or 'No file provided'}"
+    raw_findings = run_analysis_agent(text_to_analyze=context, report_id=0, file_path=file_path)
+    initial_artifacts = {}
+    for tool_run in raw_findings.get("tool_results", []):
+        if tool_run.get("tool") == "extract_artifacts":
+            initial_artifacts = tool_run.get("output", {})
+            break
+    return {
+        "summary": raw_findings.get("final_summary_text", "Analysis complete."),
+        "suspect_profile": "AI Generated (See Summary)",
+        "clues": [],
+        "artifacts": initial_artifacts,
+        "tool_results": raw_findings.get("tool_results", [])
+    }
 
 
 
@@ -2136,6 +2090,7 @@ tldextract==5.1.2
 deep-translator==1.11.4
 google-cloud-vision==3.1.2
 celery==5.3.6
+
 redis==5.0.1
 # --- Missing Dependencies Added Below ---
 Flask-Cors
@@ -2145,6 +2100,7 @@ torch
 langdetect
 tavily-python
 rq
+google-genai
 
 
 
@@ -2190,360 +2146,56 @@ if __name__ == '__main__':
 ==================== temp.py ====================
 
 import os
-from dotenv import load_dotenv
-load_dotenv()
 import requests
 import json
-import re
-import time
-import random
-import inspect
-from pathlib import Path
-from typing import Optional
-API_KEY = os.getenv("OPENROUTER_API_KEY")
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openai/gpt-oss-20b:free"
-BASE_DIR = Path("user_files").resolve()
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-def safe_resolve_under_base(path_str: str) -> Path:
-    p = (BASE_DIR / path_str).resolve()
-    if not str(p).startswith(str(BASE_DIR)):
-        raise ValueError("Access denied: path outside sandbox.")
-    return p
-def write_file(filename: str = None, path: str = None, content: str = "") -> dict:
-    target = path or filename
-    if not target:
-        return {"ok": False, "error": "no filename provided"}
-    try:
-        p = safe_resolve_under_base(target)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content or "", encoding="utf-8")
-        return {"ok": True, "filename": str(p.relative_to(BASE_DIR)), "message": f"Wrote to '{p.name}'"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-def read_file(filename: str = None, path: str = None) -> dict:
-    target = path or filename
-    if not target:
-        return {"ok": False, "error": "no filename provided"}
-    try:
-        p = safe_resolve_under_base(target)
-        text = p.read_text(encoding="utf-8")
-        return {"ok": True, "filename": str(p.relative_to(BASE_DIR)), "content": text}
-    except FileNotFoundError:
-        return {"ok": False, "error": "file not found"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-def list_files(path: str = "") -> dict:
-    try:
-        p = safe_resolve_under_base(path) if path else BASE_DIR
-        files = [str(f.relative_to(BASE_DIR)) for f in p.rglob("*") if f.is_file()]
-        return {"ok": True, "files": files}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-TOOL_REGISTRY = {
-    "createfile": write_file,
-    "write_file": write_file,
-    "read_file": read_file,
-    "list_files": list_files,
-}
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "createfile",
-            "description": "Create or overwrite a text file in the sandbox. Args: filename, content, optional type.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string"},
-                    "content": {"type": "string"},
-                    "type": {"type": "string"}
-                },
-                "required": ["filename", "content"]
-            }
+from dotenv import load_dotenv
+def test_keys():
+    print("--- Starting Gemini API Key Test ---")
+    if load_dotenv():
+        print("✅ .env file loaded successfully.")
+    else:
+        print("❌ WARNING: No .env file found in this directory.")
+        return
+    api_keys_str = os.getenv("GEMINI_API_KEYS")
+    if not api_keys_str:
+        print("❌ FAILURE: 'GEMINI_API_KEYS' not found in your .env file.")
+        print("   Please ensure the variable is named correctly and has no typos.")
+        return
+    api_keys = [key.strip() for key in api_keys_str.split(',') if key.strip()]
+    print(f"✅ Found {len(api_keys)} API key(s) to test.")
+    for i, key in enumerate(api_keys):
+        print(f"\n--- Testing Key #{i+1} (ends with '...{key[-4:]}') ---")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": "Hello"}]}]
         }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a text file. Args: filename",
-            "parameters": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "List files under a path in the sandbox. Args: path (optional)",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
-        }
-    },
-]
-def clean_code_fence(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```") and text.endswith("```"):
-        parts = text.split("```")
-        if len(parts) >= 3:
-            return "```".join(parts[1:-1]).strip()
-        return text.strip("`")
-    return text
-def extract_first_json(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    text = clean_code_fence(text)
-    start = text.find("{")
-    if start == -1:
-        return None
-    for end in range(start + 1, min(len(text), start + 8000)):
-        if text[end] == "}":
-            cand = text[start:end+1]
-            try:
-                return json.loads(cand)
-            except Exception:
-                continue
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
-QUOTE_RE = re.compile(r'["\'](.*?)["\']')
-def extract_user_provided_content(user_input: str) -> Optional[str]:
-    if not user_input:
-        return None
-    m = QUOTE_RE.search(user_input)
-    if m:
-        return m.group(1).strip()
-    patterns = [
-        r'and write (?:a |the )?(?:simple )?(.*?)$',
-        r'with content (.*?)$',
-        r'write (.*?)$',
-        r'contents?: (.*?)$',
-    ]
-    for pat in patterns:
-        mm = re.search(pat, user_input, re.IGNORECASE)
-        if mm:
-            return mm.group(1).strip(' ."\'')
-    return None
-def local_fallback_simulator(messages):
-    last_user = None
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            last_user = m.get("content", "")
-            break
-    if not last_user:
-        content = json.dumps({"call":"assistant","message":"I am offline but ready to help."})
-        return {"choices":[{"message":{"content": content}}]}
-    lower = last_user.lower()
-    if ("create file" in lower) or ("create" in lower and "file" in lower):
-        user_content = extract_user_provided_content(last_user)
-        wants_generate = "generate" in lower or "generate a" in lower
-        mname = re.search(r'file\s+([A-Za-z0-9_\-\.]+)', last_user)
-        filename = mname.group(1) if mname else "untitled.txt"
-        if not user_content and wants_generate:
-            if filename.endswith(".js"):
-                generated = "console.log('Hello, world!');"
-            elif filename.endswith(".py"):
-                generated = "print('Hello, world!')"
-            else:
-                generated = "Hello, world!"
-            args = {"filename": filename, "content": generated, "type": filename.split(".")[-1] if "." in filename else "text"}
-        else:
-            content_to_use = user_content or ""
-            args = {"filename": filename, "content": content_to_use, "type": filename.split(".")[-1] if "." in filename else "text"}
-        system_obj = {"call":"system","function":{"name":"createfile","args": args}}
-        return {"choices":[{"message":{"content": json.dumps(system_obj)}}]}
-    assistant_obj = {"call":"assistant","message":"(local fallback) I can't reach the API right now but here's a helpful reply."}
-    return {"choices":[{"message":{"content": json.dumps(assistant_obj)}}]}
-def chat_with_ai(messages, temperature: float = 0.2, timeout: int = 60, max_retries: int = 5):
-    if not API_KEY:
-        print("⚠️ OPENROUTER_API_KEY not set. Using local fallback simulator.")
-        return local_fallback_simulator(messages)
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": MODEL, "messages": messages, "temperature": temperature, "tools": TOOLS_SCHEMA, "tool_choice": "auto"}
-    attempt = 0
-    while attempt <= max_retries:
-        attempt += 1
         try:
-            r = requests.post(API_URL, headers=headers, json=payload, timeout=timeout)
-            if 200 <= r.status_code < 300:
-                try:
-                    return r.json()
-                except Exception:
-                    print("❌ Failed to parse JSON; using fallback.")
-                    return local_fallback_simulator(messages)
-            if r.status_code == 429:
-                print(f"⚠️ Received 429 rate limit (attempt {attempt}/{max_retries}). Backing off...")
-                sleep_for = min(30, (2 ** attempt) * 0.5) + random.uniform(0, 0.5)
-                time.sleep(sleep_for)
-                continue
-            if 500 <= r.status_code < 600:
-                print(f"⚠️ Server error {r.status_code} (attempt {attempt}/{max_retries}). Retrying...")
-                sleep_for = min(30, (2 ** attempt) * 0.5) + random.uniform(0, 0.5)
-                time.sleep(sleep_for)
-                continue
-            print(f"❌ OpenRouter returned status {r.status_code}. Body: {r.text}")
-            return local_fallback_simulator(messages)
-        except requests.RequestException as e:
-            print(f"⚠️ Network error (attempt {attempt}/{max_retries}): {e}")
-            time.sleep(min(30, (2 ** attempt) * 0.5) + random.uniform(0, 0.5))
-            continue
-    print("❌ Exhausted retries. Falling back to local simulator.")
-    return local_fallback_simulator(messages)
-def execute_tool_by_name(name: str, args: dict, user_input_content: Optional[str]) -> dict:
-    if not name:
-        return {"ok": False, "error": "no function name provided"}
-    func = TOOL_REGISTRY.get(name)
-    if not func:
-        return {"ok": False, "error": f"unknown function '{name}'"}
-    normalized = {}
-    if isinstance(args, dict):
-        for k, v in args.items():
-            lk = k.lower()
-            if lk in ("filename", "file", "path", "name"):
-                normalized.setdefault("filename", v)
-                normalized.setdefault("path", v)
-            elif lk in ("content", "body"):
-                normalized["content"] = v
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code == 200:
+                print(f"✅ SUCCESS! Key #{i+1} is working correctly.")
+                print(f"   API Response Snippet: {response.json()['candidates'][0]['content']['parts'][0]['text'][:30]}...")
             else:
-                normalized[k] = v
-    elif isinstance(args, str):
-        normalized["content"] = args
-    if "content" not in normalized and user_input_content:
-        normalized["content"] = user_input_content
-    sig = inspect.signature(func)
-    func_kwargs = {}
-    for param in sig.parameters:
-        if param in normalized:
-            func_kwargs[param] = normalized[param]
-    if 'path' in sig.parameters and 'path' not in func_kwargs and 'filename' in normalized:
-        func_kwargs['path'] = normalized['filename']
-    if 'filename' in sig.parameters and 'filename' not in func_kwargs and 'path' in normalized:
-        func_kwargs['filename'] = normalized['path']
-    print("→ Executing local function:", func.__name__, "with kwargs:", func_kwargs)
-    try:
-        return func(**func_kwargs)
-    except TypeError as e:
-        try:
-            print("⚠️ TypeError calling with restricted kwargs; trying full normalized dict as kwargs.")
-            return func(**normalized)
-        except Exception as ex:
-            return {"ok": False, "error": f"function call failed: {ex}"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-SYSTEM_INSTRUCTION = (
-    "You MUST RESPOND with a single top-level JSON object only.\n"
-    "If you want the integration to execute a tool, reply with: "
-    '{"call":"system","function":{"name":"<tool_name>","args":{...}}}\n'
-    "If no tool is needed, reply with: {\"call\":\"assistant\",\"message\":\"...\"}\n"
-    "Supported tools: createfile (filename, content), read_file (filename), list_files (path).\n"
-)
-def main():
-    print("OpenRouter JSON-agent (fixed mapping). Type 'quit' or 'exit'.")
-    print("Files under:", BASE_DIR)
-    messages = [{"role":"system","content": SYSTEM_INSTRUCTION}]
-    while True:
-        try:
-            usr = input("\nYou: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye.")
-            break
-        if not usr:
-            continue
-        if usr.lower() in ("quit", "exit"):
-            print("Bye.")
-            break
-        user_provided_content = extract_user_provided_content(usr)
-        messages.append({"role":"user","content": usr})
-        resp = chat_with_ai(messages)
-        if not resp:
-            print("No response.")
-            continue
-        tool_calls = resp.get("tool_calls") or []
-        assistant_raw = ""
-        choices = resp.get("choices", [])
-        if choices:
-            assistant_raw = choices[0].get("message", {}).get("content") or ""
-            if not tool_calls:
-                tool_calls = choices[0].get("message", {}).get("tool_calls") or []
-        if tool_calls:
-            tc = tool_calls[0]
-            func_name = tc.get("function", {}).get("name") or tc.get("name") or tc.get("function_name")
-            params = tc.get("function", {}).get("arguments") or tc.get("function", {}).get("parameters") or tc.get("arguments") or tc.get("parameters") or {}
-            if isinstance(params, str):
-                try:
-                    params = json.loads(params)
-                except json.JSONDecodeError:
-                    print(f"⚠️ Failed to parse arguments as JSON: {params}")
-                    params = {}
-            if not func_name:
-                print("Malformed tool_calls:", tc)
-                messages.append({"role":"assistant","content":"Error: malformed tool_calls"})
-                continue
-            print(f"Model requested tool: {func_name} with args: {params}")
-            result = execute_tool_by_name(func_name, params or {}, user_provided_content)
-            messages.append({"role":"function","name":func_name,"content": json.dumps(result)})
-            user_action = {"call":"user","action": {func_name: "success" if result.get("ok") else "error", "filename": result.get("filename",""), "detail": result.get("message") or result.get("error","")}}
-            messages.append({"role":"user","content": json.dumps(user_action)})
-            if result.get("ok"):
-                print(f"✅ Tool succeeded: {result.get('filename')}  ({result.get('message')})")
-            else:
-                print(f"❌ Tool failed: {result.get('error')}")
-            follow = chat_with_ai(messages)
-            if not follow:
-                print("No follow-up.")
-                continue
-            choices2 = follow.get("choices", [])
-            if choices2:
-                final_content = choices2[0].get("message", {}).get("content") or ""
-                parsed = extract_first_json(final_content)
-                if parsed:
-                    print("\n🤖 AI (json):", json.dumps(parsed, indent=2))
-                else:
-                    print("\n🤖 AI:", final_content.strip())
-                messages.append({"role":"assistant","content": final_content})
-            continue
-        assistant_text = assistant_raw or (choices[0].get("message", {}).get("content") if choices else "")
-        parsed = extract_first_json(assistant_text)
-        if parsed and isinstance(parsed, dict) and parsed.get("call") == "system" and parsed.get("function"):
-            func = parsed["function"]
-            func_name = func.get("name")
-            args = func.get("args") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    print(f"⚠️ Failed to parse args as JSON: {args}")
-                    args = {}
-            print(f"(fallback) Model requested function: {func_name} args={args}")
-            result = execute_tool_by_name(func_name, args, user_provided_content)
-            messages.append({"role":"function","name":func_name,"content": json.dumps(result)})
-            user_action = {"call":"user","action": {func_name: "success" if result.get("ok") else "error", "filename": result.get("filename",""), "detail": result.get("message") or result.get("error","")}}
-            messages.append({"role":"user","content": json.dumps(user_action)})
-            if result.get("ok"):
-                print(f"✅ Tool succeeded: {result.get('filename')}  ({result.get('message')})")
-            else:
-                print(f"❌ Tool failed: {result.get('error')}")
-            follow = chat_with_ai(messages)
-            if not follow:
-                print("No follow-up.")
-                continue
-            final = follow.get("choices", [])[0].get("message", {}).get("content", "")
-            parsed_final = extract_first_json(final)
-            if parsed_final:
-                print("\n🤖 AI (json):", json.dumps(parsed_final, indent=2))
-            else:
-                print("\n🤖 AI:", final.strip())
-            messages.append({"role":"assistant","content": final})
-            continue
-        if parsed and isinstance(parsed, dict) and parsed.get("call") == "assistant":
-            print("\n🤖 AI (assistant json):", json.dumps(parsed, indent=2))
-            messages.append({"role":"assistant","content": json.dumps(parsed)})
-        else:
-            raw = assistant_text or json.dumps(resp)
-            print("\n🤖 AI:", raw.strip())
-            messages.append({"role":"assistant","content": raw})
+                print(f"❌ FAILURE! Key #{i+1} is invalid or has issues.")
+                print(f"   Status Code: {response.status_code}")
+                print(f"   API Error Response: {response.text}")
+        except requests.exceptions.RequestException as e:
+            print(f"❌ NETWORK ERROR on Key #{i+1}: Could not connect to the API.")
+            print(f"   Details: {e}")
+    print("\n--- Test Complete ---")
 if __name__ == "__main__":
-    main()
+    test_keys()
+
+
+
+
+==================== tempWEB.py ====================
+
+from tavily import TavilyClient
+client = TavilyClient("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")
+response = client.search(
+    query="java spring boot "
+)
+print(response)
 
 
 
@@ -2646,6 +2298,9 @@ if __name__ == "__main__":
 
 
 
+
+
+
 JusticeAssist/
 ├── combine.js
 ├── public/
@@ -2737,6 +2392,9 @@ JusticeAssist/
 ==================== README.md ====================
 
 <<<<<<< HEAD
+# JusticeAssitance-frontend
+=======
+<<<<<<< HEAD
 # Getting Started with Create React App
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
@@ -2820,6 +2478,7 @@ JusticeAssist is a guided cybercrime reporting and evidence-building platform de
 
 JusticeAssist bridges the gap between technology and law to empower users in taking action against cybercrime.
 >>>>>>> 1c49c99aefa4f7f5795e1f2187f42e6431c36732
+>>>>>>> b63839b (the api problem is still there i will resolve it)
 
 
 
@@ -3408,7 +3067,7 @@ import UserNavbar from './components/UserNavbar';
 import AdminNavbar from './components/AdminNavbar';
 import ScrollToTop from './components/ScrollToTop';
 import ChatbotPopup from './components/ChatbotPopup';
-
+import ProtectedRoute from './components/ProtectedRoute';
 import Home from './pages/Home';
 import Login from './pages/Login';
 import Signup from './pages/Signup';
@@ -3418,6 +3077,7 @@ import ReportDetail from './pages/ReportDetail';
 import GetGuidance from './pages/GetGuidance';
 import CyberAwareness from './pages/CyberAwareness';
 import SuspectGuess from './pages/SuspectGuess';
+import AIAssistant from './pages/AIAssistant';
 import Quiz from './pages/Quiz';
 import WhyUs from './pages/WhyUs';
 import AboutUs from './pages/AboutUs';
@@ -3425,23 +3085,9 @@ import ContactUs from './pages/ContactUs';
 
 import UserDashboard from './pages/UserDashboard';
 import AdminDashboard from './pages/admin/AdminDashboard';
-
 import AdminUsers from './pages/admin/AdminUsers';
 import AdminComplaints from './pages/admin/AdminComplaints';
 import AdminSettings from './pages/admin/AdminSettings';
-
-const ProtectedRoute = ({ children, adminOnly = false }) => {
-  const isLoggedIn = localStorage.getItem('isLoggedIn') === 'true';
-  const role = localStorage.getItem('role');
-
-  if (!isLoggedIn) {
-    return <Navigate to="/login" replace />;
-  }
-  if (adminOnly && role !== 'admin') {
-    return <Navigate to="/user/dashboard" replace />;
-  }
-  return children;
-};
 
 const App = () => {
   const location = useLocation();
@@ -3456,7 +3102,7 @@ const App = () => {
   const isAuthPage = location.pathname === '/login' || location.pathname === '/signup' || location.pathname === '/forgot-password';
 
   return (
-    <ThemeProvider> {}
+    <ThemeProvider>
       <ScrollToTop />
       {!isAuthPage && (role === 'admin' ? <AdminNavbar /> : <UserNavbar />)}
 
@@ -3475,6 +3121,7 @@ const App = () => {
         <Route path="/get-guidance" element={<ProtectedRoute><GetGuidance /></ProtectedRoute>} />
         <Route path="/awareness" element={<ProtectedRoute><CyberAwareness /></ProtectedRoute>} />
         <Route path="/suspect-guess" element={<ProtectedRoute><SuspectGuess /></ProtectedRoute>} />
+        <Route path="/chatbot" element={<ProtectedRoute><AIAssistant /></ProtectedRoute>} />
         <Route path="/quiz" element={<ProtectedRoute><Quiz /></ProtectedRoute>} />
         <Route path="/why-us" element={<WhyUs />} />
         <Route path="/about-us" element={<AboutUs />} />
@@ -3843,55 +3490,53 @@ import Lottie from "lottie-react";
 import chatbotAnim from "../assets/ChatbotHelp.json";
 import "./ChatbotPopup.css";
 import axios from "axios";
+
 const ChatbotPopup = () => {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState([
     { from: "bot", text: "Hello 👋 I’m your JusticeAssist chatbot. How can I help you?" },
   ]);
   const [input, setInput] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const handleSend = async () => {
+    if (!input.trim() || isLoading) return;
 
-    const handleSend = async () => {
-    if (!input.trim()) return;
-
-    const userMessage = input;
-    setMessages((prev) => [...prev, { from: "user", text: userMessage }]);
+    const userMessage = { from: "user", text: input };
+    setMessages((prev) => [...prev, userMessage]);
     setInput("");
+    setIsLoading(true);
 
     try {
-            const token = localStorage.getItem("token");
+      const token = localStorage.getItem("token");
       if (!token) {
-        setMessages((prev) => [
-            ...prev,
-            { from: "bot", text: "Authentication error. Please log in again." },
-        ]);
-        return;
+        throw new Error("Authentication error. Please log in again.");
       }
 
-      const response = await axios.post(
-        `${process.env.REACT_APP_API_URL}/ai/get-guidance`,         { query: userMessage },
-        {
+                  const response = await axios.post(
+        `${process.env.REACT_APP_API_URL}/ai/get-guidance`,
+        { query: userMessage.text },         {
           headers: {
-                        Authorization: `Bearer ${token}`,
+            Authorization: `Bearer ${token}`,
           },
         }
       );
 
-            setMessages((prev) => [
-        ...prev,
-        {
-          from: "bot",
-          text: response.data.guidance || "I received a response, but it was empty.",
-        },
-      ]);
+      const botResponse = {
+        from: "bot",
+        text: response.data.guidance || "I received a response, but it was empty.",
+      };
+      setMessages((prev) => [...prev, botResponse]);
+
     } catch (err) {
-      console.error("Chatbot API error:", err);
-            const errorMessage = err.response?.status === 401
+      console.error("ChatbotPopup API error:", err);
+      const errorMessage = err.response?.status === 401
         ? "Your session has expired. Please log in again."
         : "Sorry, I'm having trouble connecting to the server.";
-      setMessages((prev) => [
-        ...prev,
-        { from: "bot", text: `⚠️ ${errorMessage}` },
-      ]);
+
+      const errorResponse = { from: "bot", text: `⚠️ ${errorMessage}` };
+      setMessages((prev) => [...prev, errorResponse]);
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -3904,15 +3549,12 @@ const ChatbotPopup = () => {
 
   return (
     <div>
-      {}
       <button className="chatbot-button" onClick={() => setOpen(!open)}>
         <Lottie animationData={chatbotAnim} loop={true} className="chatbot-lottie" />
       </button>
 
-      {}
       {open && (
         <div className="chatbot-popup">
-          {}
           <div className="chatbot-header">
             <h3>JusticeAssist Chatbot</h3>
             <button onClick={() => setOpen(false)}>
@@ -3920,19 +3562,18 @@ const ChatbotPopup = () => {
             </button>
           </div>
 
-          {}
           <div className="chatbot-messages">
             {messages.map((msg, index) => (
               <div
                 key={index}
-                className={`chatbot-message ${msg.from === "user" ? "user" : "bot"}`}
+                className={`chatbot-message ${msg.from}`}
               >
                 {msg.text}
               </div>
             ))}
+            {isLoading && <div className="chatbot-message bot">Typing...</div>}
           </div>
 
-          {}
           <div className="chatbot-input-container">
             <input
               type="text"
@@ -3941,8 +3582,9 @@ const ChatbotPopup = () => {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               className="chatbot-input"
+              disabled={isLoading}
             />
-            <button className="chatbot-send-btn" onClick={handleSend}>
+            <button className="chatbot-send-btn" onClick={handleSend} disabled={isLoading}>
               ➤
             </button>
           </div>
@@ -5734,16 +5376,27 @@ export default UserNavbar;
 
 ==================== src/components/ProtectedRoute.jsx ====================
 
+
+
 import React from 'react';
 import { Navigate } from 'react-router-dom';
 
-const ProtectedRoute = ({ children }) => {
-  const isLoggedIn = localStorage.getItem('isLoggedIn');
-  return isLoggedIn ? children : <Navigate to="/login" replace />;
+const ProtectedRoute = ({ children, adminOnly = false }) => {
+  const isLoggedIn = localStorage.getItem('isLoggedIn') === 'true';
+  const role = localStorage.getItem('role');
+
+  if (!isLoggedIn) {
+        return <Navigate to="/login" replace />;
+  }
+
+  if (adminOnly && role !== 'admin') {
+        return <Navigate to="/user/dashboard" replace />;
+  }
+
+  return children;
 };
 
 export default ProtectedRoute;
-
 
 
 
@@ -6301,21 +5954,67 @@ reportWebVitals();
 
 ==================== src/pages/AIAssistant.jsx ====================
 
-import React, { useState } from 'react';
+
+
+import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import './AIAssistant.css';
+import axios from 'axios';
 
 const AIAssistant = () => {
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState([
+    { text: "Hello! I am your AI assistant. How can I help you with your cybercrime-related questions today?", sender: 'ai' }
+  ]);
   const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const chatWindowRef = useRef(null);
 
-  const handleSend = () => {
-    if (input.trim()) {
-      setMessages([...messages, { text: input, sender: 'user' }]);
+    useEffect(() => {
+    if (chatWindowRef.current) {
+      chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  const handleSend = async () => {
+    if (input.trim() && !isLoading) {
+      const userMessage = { text: input, sender: 'user' };
+      setMessages(prevMessages => [...prevMessages, userMessage]);
       setInput('');
-            setTimeout(() => {
-        setMessages(prevMessages => [...prevMessages, { text: 'This is a simulated response from the AI Assistant.', sender: 'ai' }]);
-      }, 1000);
+      setIsLoading(true);
+
+      try {
+        const token = localStorage.getItem("token");
+        if (!token) {
+          throw new Error("Authentication token not found. Please log in.");
+        }
+
+        const response = await axios.post(
+          `${process.env.REACT_APP_API_URL}/ai/get-guidance`,
+          { query: input },
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+
+        const aiResponse = {
+          text: response.data.guidance || "I received a response, but it was empty.",
+          sender: 'ai'
+        };
+        setMessages(prevMessages => [...prevMessages, aiResponse]);
+
+      } catch (err) {
+        console.error("AI Assistant API error:", err);
+        const errorMessage = err.response?.status === 401
+          ? "Your session has expired. Please log in again."
+          : "Sorry, I'm having trouble connecting to the server right now.";
+
+        const errorResponse = { text: `⚠️ ${errorMessage}`, sender: 'ai' };
+        setMessages(prevMessages => [...prevMessages, errorResponse]);
+      } finally {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -6324,7 +6023,7 @@ const AIAssistant = () => {
       <div className="chat-header">
         AI Assistant
       </div>
-      <div className="chat-window">
+      <div className="chat-window" ref={chatWindowRef}>
         <AnimatePresence>
           {messages.map((msg, index) => (
             <motion.div
@@ -6339,6 +6038,16 @@ const AIAssistant = () => {
             </motion.div>
           ))}
         </AnimatePresence>
+        {isLoading && (
+          <motion.div
+            className="message ai"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            Typing...
+          </motion.div>
+        )}
       </div>
       <div className="input-area">
         <input
@@ -6347,15 +6056,17 @@ const AIAssistant = () => {
           onChange={(e) => setInput(e.target.value)}
           onKeyPress={(e) => e.key === 'Enter' && handleSend()}
           placeholder="Type your message..."
+          disabled={isLoading}
         />
-        <button onClick={handleSend}>Send</button>
+        <button onClick={handleSend} disabled={isLoading}>
+          {isLoading ? 'Sending...' : 'Send'}
+        </button>
       </div>
     </div>
   );
 };
 
 export default AIAssistant;
-
 
 
 

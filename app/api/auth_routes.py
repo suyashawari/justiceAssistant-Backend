@@ -55,24 +55,22 @@
 
 
 
-
 from flask import Blueprint, request, jsonify
 from app.models import db
 from app.models.models import User
 from flask_jwt_extended import create_access_token
 from datetime import timedelta
-from flask_cors import CORS # <-- 1. IMPORT CORS
-import re # <-- IMPORT re
+# --- REMOVED: CORS and re imports are no longer needed here ---
+# from flask_cors import CORS
+# import re
+# ------------------------------------------------------------
 
 auth = Blueprint('auth', __name__)
 
-# --- 2. ADD THIS PERMISSIVE CORS CONFIGURATION ---
-# WARNING: This is for development only. It allows any website to make requests.
-# It uses a regex because a simple '*' does not work with `supports_credentials=True`.
-dev_origins_regex = re.compile(r".*") 
-CORS(auth, origins=dev_origins_regex, supports_credentials=True)
-# --- END OF ADDITION ---
-
+# --- REMOVED: The local, blueprint-specific CORS configuration is now handled globally ---
+# dev_origins_regex = re.compile(r".*")
+# CORS(auth, origins=dev_origins_regex, supports_credentials=True)
+# --------------------------------------------------------------------------------------
 
 @auth.route('/register', methods=['POST'])
 def register():
@@ -88,8 +86,6 @@ def register():
     db.session.add(new_user)
     db.session.commit()
     return jsonify({'message': 'User registered successfully'}), 201
-
-
 @auth.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -97,11 +93,9 @@ def login():
     password = data.get('password')
     role_from_request = data.get('role')
     user = User.query.filter_by(username=username).first()
-
     if user and user.check_password(password):
         if role_from_request == 'admin' and user.role != 'admin':
             return jsonify({'error': 'Insufficient permissions to log in as admin'}), 401
-        
         additional_claims = {"role": user.role}
         access_token = create_access_token(
             identity=str(user.id),
@@ -109,5 +103,4 @@ def login():
             additional_claims=additional_claims
         )
         return jsonify({'access_token': access_token}), 200
-
     return jsonify({'error': 'Invalid credentials or insufficient permissions'}), 401

@@ -52,6 +52,7 @@ tldextract==5.1.2
 deep-translator==1.11.4
 google-cloud-vision==3.1.2
 celery==5.3.6
+
 redis==5.0.1
 # --- Missing Dependencies Added Below ---
 Flask-Cors
@@ -61,3 +62,4 @@ torch
 langdetect
 tavily-python
 rq
+google-genai
