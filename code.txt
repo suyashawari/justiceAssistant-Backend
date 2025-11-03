@@ -1,4 +1,5 @@
 justiceassist/
+├── agent_runs.txt
 ├── app/
 │   ├── api/
 │   │   ├── __init__.py
@@ -16,6 +17,7 @@ justiceassist/
 │       ├── __init__.py
 │       ├── classifier.py
 │       ├── decorators.py
+│       ├── file_metadata_extractor.py
 │       ├── gemini_agent.py
 │       ├── gemini_helper.py
 │       ├── legal_references.py
@@ -34,6 +36,13 @@ justiceassist/
 ├── temp.py
 ├── tempWEB.py
 ├── test_redis_celery.py
+
+
+
+
+==================== agent_runs.txt ====================
+
+
 
 
 
@@ -235,9 +244,8 @@ from app.models.models import Report
 from werkzeug.utils import secure_filename
 from app.utils.suspect_utils import analyze_evidence
 load_dotenv()
-openrouter_key = os.getenv("OPENROUTER_API_KEY")
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openai/gpt-oss-20b:free"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+GEMINI_API_KEYS = [key.strip() for key in os.getenv("GEMINI_API_KEYS", "").split(",") if key.strip()]
 ai = Blueprint('ai', __name__)
 UPLOAD_FOLDER = "uploads"
 @ai.route('/get-guidance', methods=['POST'])
@@ -253,44 +261,50 @@ def get_guidance():
         "Explain the type of cybercrime, immediate steps the user should take, "
         "what evidence to collect, and which sections of Indian law might apply. "
         "Keep the tone helpful and reassuring.\n\n"
+        "make it in 3 to 4 lines short and simple words and no table or bullet points just plain text\n\n"
         f"User Query: \"{user_query}\""
     )
-    if not openrouter_key:
-        print("ERROR: OPENROUTER_API_KEY not found in .env file.")
+    if not GEMINI_API_KEYS:
+        print("ERROR: GEMINI_API_KEYS not found in .env file.")
         return jsonify({
             "status": "error",
             "error": "AI service is not configured correctly on the server."
         }), 500
     try:
+        api_key = GEMINI_API_KEYS[0]
+        full_url = f"{GEMINI_API_URL}?key={api_key}"
         headers = {
-            "Authorization": f"Bearer {openrouter_key}",
             "Content-Type": "application/json"
         }
         payload = {
-            "model": MODEL,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }]
         }
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=90)
+        response = requests.post(full_url, headers=headers, json=payload, timeout=90)
         response.raise_for_status()
         response_data = response.json()
-        guidance_text = response_data['choices'][0]['message']['content']
+        guidance_text = response_data['candidates'][0]['content']['parts'][0]['text']
         return jsonify({
             "status": "success",
-            "provider": f"OpenRouter ({MODEL})",
+            "provider": "Google Gemini",
             "guidance": guidance_text
         }), 200
     except requests.exceptions.RequestException as e:
-        print(f"OpenRouter API request failed: {e}")
-        if e.response and e.response.status_code in [401, 403]:
-            return jsonify({"status": "error", "error": "AI service authentication failed. Check server API key."}), 500
+        print(f"Gemini API request failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+             if e.response.status_code in [401, 403, 429]:
+                return jsonify({"status": "error", "error": "AI service authentication failed. Check server API key."}), 500
+        return jsonify({
+            "status": "error",
+            "error": "The AI guidance service failed to connect. Please try again later."
+        }), 500
     except Exception as e:
-        print(f"An error occurred while processing the OpenRouter response: {e}")
-    return jsonify({
-        "status": "error",
-        "error": "The AI guidance service failed. Please try again later."
-    }), 500
+        print(f"An error occurred while processing the Gemini response: {e}")
+        return jsonify({
+            "status": "error",
+            "error": "An unexpected error occurred with the AI guidance service."
+        }), 500
 @ai.route('/guess-suspect', methods=['POST'])
 @jwt_required()
 def guess_suspect():
@@ -752,6 +766,7 @@ class User(db.Model):
 from app.utils.gemini_agent import run_analysis_agent
 from datetime import datetime
 import json
+from app.utils.file_metadata_extractor import extract_rich_metadata
 def analyze_report_task(report_id):
     try:
         from app.models import create_app, db
@@ -770,6 +785,15 @@ def analyze_report_task(report_id):
             print(f"Handing off report {report_id} to the AI agent...")
             report.status = 'analyzing'
             db.session.commit()
+            form_data_json = json.dumps(report.to_dict(), indent=2)
+            file_metadata = None
+            if report.evidence_file:
+                print(f"Running local metadata extraction for: {report.evidence_file}")
+                file_metadata = extract_rich_metadata(report.evidence_file)
+            report_context = (
+                f"## User Submitted Form Data ##\n{form_data_json}\n\n"
+                f"## Locally Extracted File Metadata ##\n{json.dumps(file_metadata, indent=2) if file_metadata else 'No file provided or metadata found.'}"
+            )
             raw_findings = run_analysis_agent(
                 text_to_analyze=report_context,
                 report_id=report.id,
@@ -957,6 +981,66 @@ def admin_required():
 
 
 
+==================== app/utils/file_metadata_extractor.py ====================
+
+import fitz
+import piexif
+from PIL import Image
+def get_gps_from_exif(exif_dict):
+    gps_info = {}
+    if "GPS" in exif_dict:
+        for tag, value in exif_dict["GPS"].items():
+            tag_name = piexif.GPSIFD.TAGS.get(tag, {}).get("name", tag)
+            gps_info[tag_name] = str(value)
+    return gps_info if gps_info else None
+def extract_rich_metadata(file_path):
+    metadata = {
+        "file_path": file_path,
+        "metadata": {},
+        "annotations": [],
+        "error": None
+    }
+    try:
+        if file_path.lower().endswith(('.jpg', '.jpeg', '.tiff', '.png')):
+            img = Image.open(file_path)
+            metadata["metadata"]["format"] = img.format
+            metadata["metadata"]["mode"] = img.mode
+            metadata["metadata"]["size"] = f"{img.width}x{img.height}"
+            if "exif" in img.info:
+                exif_dict = piexif.load(img.info["exif"])
+                general_exif = {}
+                for ifd in ("0th", "Exif", "1st"):
+                    if ifd in exif_dict:
+                        for tag, value in exif_dict[ifd].items():
+                            tag_name = piexif.TAGS.get(ifd, {}).get(tag, {}).get("name", tag)
+                            if isinstance(value, bytes) and len(value) > 50:
+                                general_exif[tag_name] = str(value[:50]) + "..."
+                            else:
+                                general_exif[tag_name] = str(value)
+                metadata["metadata"]["exif"] = general_exif
+                gps_data = get_gps_from_exif(exif_dict)
+                if gps_data:
+                    metadata["metadata"]["gps"] = gps_data
+        elif file_path.lower().endswith('.pdf'):
+            doc = fitz.open(file_path)
+            metadata["metadata"] = doc.metadata
+            for page_num, page in enumerate(doc):
+                annots = page.annots()
+                if annots:
+                    for annot in annots:
+                        metadata["annotations"].append({
+                            "page": page_num + 1,
+                            "type": annot.type[1],
+                            "info": annot.info
+                        })
+            doc.close()
+    except Exception as e:
+        metadata["error"] = f"Failed to extract metadata: {str(e)}"
+    return metadata
+
+
+
+
 ==================== app/utils/gemini_agent.py ====================
 
 import os
@@ -968,13 +1052,24 @@ import time
 import random
 import re
 import traceback
+import base64
+import logging
+from datetime import datetime
 from app.utils.suspect_utils import TOOL_REGISTRY
+logger = logging.getLogger('AgentLogger')
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    handler = logging.FileHandler('agent_runs.log')
+    formatter = logging.Formatter('%(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 GEMINI_API_KEYS = [key.strip() for key in os.getenv("GEMINI_API_KEYS", "").split(",") if key.strip()]
 if not GEMINI_API_KEYS and os.getenv("GOOGLE_API_KEY"):
     GEMINI_API_KEYS = [os.getenv("GOOGLE_API_KEY")]
 API_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
 MODEL = "gemini-flash-latest"
 MAX_TURNS = 10
+MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024
 def clean_and_parse_json(text: str):
     if not text: return {}
     text = text.strip()
@@ -992,9 +1087,20 @@ def clean_and_parse_json(text: str):
             except:
                 pass
     return {"purpose": "error", "error_message": "AI returned malformed JSON."}
-def chat_with_gemini(messages, current_key_index, temperature: float = 0.2, timeout: int = 90, max_retries: int = 3):
+def get_file_mime_type(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ['.jpg', '.jpeg']:
+        return 'image/jpeg'
+    if ext == '.png':
+        return 'image/png'
+    if ext == '.pdf':
+        return 'application/pdf'
+    return None
+def chat_with_gemini(messages, current_key_index, temperature: float = 0.2, timeout: int = 180, max_retries: int = 3):
     if not GEMINI_API_KEYS:
-        print("❌ [AGENT ERROR] No Gemini API keys configured.")
+        error_msg = "❌ [AGENT ERROR] No Gemini API keys configured."
+        logger.error(error_msg)
+        print(error_msg)
         return {"purpose": "error", "error_message": "AI service is not configured."}, current_key_index
     local_key_index = current_key_index
     for attempt in range(max_retries):
@@ -1007,7 +1113,10 @@ def chat_with_gemini(messages, current_key_index, temperature: float = 0.2, time
                 system_instruction = m['content']
             else:
                 role = 'model' if m['role'] in ['assistant', 'model'] else 'user'
-                content_for_api.append({'role': role, 'parts': [{'text': m['content']}]})
+                if 'parts' in m:
+                    content_for_api.append({'role': role, 'parts': m['parts']})
+                else:
+                    content_for_api.append({'role': role, 'parts': [{'text': m['content']}]})
         payload = {
             "contents": content_for_api,
             "system_instruction": {'parts': [{'text': system_instruction}]},
@@ -1016,11 +1125,17 @@ def chat_with_gemini(messages, current_key_index, temperature: float = 0.2, time
             }
         }
         try:
+            log_payload = json.dumps(payload, indent=2)
+            logger.info(f"REQUEST to Gemini:\n{log_payload}")
             r = requests.post(url, json=payload, timeout=timeout)
             if 200 <= r.status_code < 300:
                 response_data = r.json()
+                log_response = json.dumps(response_data, indent=2)
+                logger.info(f"RESPONSE from Gemini:\n{log_response}")
                 ai_response_text = response_data['candidates'][0]['content']['parts'][0]['text']
                 return clean_and_parse_json(ai_response_text), local_key_index
+            error_details = f"Status: {r.status_code}, Response: {r.text}"
+            logger.error(f"[API ERROR] {error_details}")
             if r.status_code in [401, 403, 429]:
                 print(f"🚫 Key failed with status {r.status_code}. Rotating key.")
                 local_key_index += 1
@@ -1033,13 +1148,21 @@ def chat_with_gemini(messages, current_key_index, temperature: float = 0.2, time
             print(f"❌ Unhandled status {r.status_code}. Failing. Response: {r.text}")
             return {"purpose": "error", "error_message": f"API failed with status {r.status_code}"}, local_key_index
         except requests.exceptions.RequestException as e:
-            print(f"Network error: {e}. Retrying...")
+            error_message = f"Network error: {e}. Retrying..."
+            logger.error(f"[AGENT ERROR] {error_message}")
+            print(error_message)
             time.sleep(1.5 ** attempt)
         except Exception as e:
-            print(f"General error: {e}. Failing.")
+            error_message = f"General error: {e}. Failing."
+            logger.error(f"[AGENT ERROR] {error_message}")
+            print(error_message)
             return {"purpose": "error", "error_message": str(e)}, local_key_index
-    return {"purpose": "error", "error_message": "All API keys failed or retries exhausted."}, local_key_index
+    final_error_msg = "All API keys failed or retries exhausted."
+    logger.error(f"[AGENT ERROR] {final_error_msg}")
+    return {"purpose": "error", "error_message": final_error_msg}, local_key_index
 def run_analysis_agent(text_to_analyze: str, report_id: int, file_path: str = None):
+    logger.info("\n\n" + "="*20 + f" REPORT ID: {report_id} " + "="*20)
+    logger.info(f"START TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     current_key_index = 0
     findings = {
         "tool_results": [],
@@ -1047,49 +1170,96 @@ def run_analysis_agent(text_to_analyze: str, report_id: int, file_path: str = No
         "errors": []
     }
     SYSTEM_PROMPT = (
-        "You are an autonomous Cyber Investigator. Your goal is to provide a comprehensive, evidence-backed summary of the cybercrime incident."
+        "You are an autonomous Cyber Investigator. Your goal is to provide a comprehensive, evidence-backed summary of a cybercrime incident. "
+        "You will receive the user's report form data, pre-extracted file metadata, and potentially the evidence file itself. "
         "Your responses MUST be a single, valid JSON object with the following structure:\n"
-        "1. **`purpose`**: [\"extract_artifacts\", \"inspect_urls\", \"inspect_ips\", \"web_search\", \"summarize_findings\", \"stop_investigation\", \"error\"]\n"
-        "2. **`parameters`**: {args for the tool, e.g., {\"text\": \"...\"}} (omit if summarizing/stopping)\n"
+        "1. **`purpose`**: [\"inspect_urls\", \"inspect_ips\", \"web_search\", \"summarize_findings\", \"stop_investigation\", \"error\"]\n"
+        "2. **`parameters`**: {args for the tool, e.g., {\"urls\": [...]}} (omit if summarizing/stopping)\n"
         "3. **`final_summary`**: \"Your comprehensive final analysis text.\" (only include if purpose is \"summarize_findings\")\n\n"
         "RULES:\n"
+        "- Your first step is to analyze all the provided information (form, metadata, file) and then decide which tool to use next.\n"
+        "- DO NOT call a tool named `extract_artifacts`. That has been done for you.\n"
         "- Base your decisions ONLY on the evidence and tool results provided in the history.\n"
         "- Do not call tools with empty data (e.g., inspect_urls with an empty list).\n"
         f"- Maximum {MAX_TURNS} turns allowed. Use `summarize_findings` to stop the investigation."
     )
+    initial_user_content = [
+        {'text': f"BEGIN ANALYSIS. Full Report Context:\n\n{text_to_analyze}"}
+    ]
+    if file_path and os.path.exists(file_path):
+        file_size = os.path.getsize(file_path)
+        if file_size < MAX_FILE_SIZE_BYTES:
+            print(f"File size ({file_size} bytes) is within limit. Uploading to AI.")
+            mime_type = get_file_mime_type(file_path)
+            if mime_type:
+                try:
+                    with open(file_path, "rb") as f:
+                        file_data = base64.b64encode(f.read()).decode('utf-8')
+                    initial_user_content.append({
+                        'inline_data': {
+                            'mime_type': mime_type,
+                            'data': file_data
+                        }
+                    })
+                except Exception as e:
+                    print(f"Error encoding file for AI: {e}")
+            else:
+                print(f"Unsupported file type for AI upload: {file_path}")
+        else:
+            print(f"File size ({file_size} bytes) exceeds limit. Not uploading file to AI.")
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"BEGIN ANALYSIS. Full Report Context:\n\n{text_to_analyze}"}
+        {"role": "user", "parts": initial_user_content}
     ]
-    print(f"\n{'='*60}\nStarting Gemini Stateless Agent for Report ID: {report_id} (Max Turns: {MAX_TURNS})\n{'='*60}")
+    start_message = f"Starting Gemini Multimodal Agent for Report ID: {report_id} (Max Turns: {MAX_TURNS})"
+    logger.info("="*len(start_message))
+    logger.info(start_message)
+    logger.info("="*len(start_message))
     for turn in range(MAX_TURNS):
+        logger.info(f"\n--- Agent Turn {turn + 1} / {MAX_TURNS} ---")
         print(f"\n--- Agent Turn {turn + 1} / {MAX_TURNS} ---")
         ai_response_json, new_key_index = chat_with_gemini(messages, current_key_index)
         current_key_index = new_key_index
         messages.append({"role": "model", "content": json.dumps(ai_response_json)})
         purpose = ai_response_json.get("purpose", "error")
         parameters = ai_response_json.get("parameters", {})
+        logger.info(f"[AGENT LOG] AI decided on purpose: `{purpose}`")
         if purpose == "summarize_findings":
             findings["final_summary_text"] = ai_response_json.get("final_summary", "Agent finished with a successful summary.")
-            print("[AGENT LOG] Final summary received. Investigation complete.")
+            log_msg = "[AGENT LOG] Final summary received. Investigation complete."
+            logger.info(log_msg)
+            print(log_msg)
+            logger.info(f"END TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("="*55 + "\n")
             return findings
         if purpose == "stop_investigation":
             findings["final_summary_text"] = "Agent explicitly stopped the investigation due to a dead end."
-            print("[AGENT LOG] Agent explicitly stopped. Investigation complete.")
+            log_msg = "[AGENT LOG] Agent explicitly stopped. Investigation complete."
+            logger.info(log_msg)
+            print(log_msg)
+            logger.info(f"END TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("="*55 + "\n")
             return findings
         if purpose == "error" or purpose not in TOOL_REGISTRY:
             error_msg = ai_response_json.get("error_message", f"AI returned an unhandled error or unknown purpose: {purpose}")
             findings["errors"].append(error_msg)
-            print(f"❌ [AGENT ERROR] {error_msg}")
+            log_msg = f"❌ [AGENT ERROR] {error_msg}"
+            logger.error(log_msg)
+            print(log_msg)
             findings["final_summary_text"] = f"Investigation Halted on Turn {turn + 1} due to error: {error_msg}. Finalizing report with partial findings."
+            logger.info(f"END TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("="*55 + "\n")
             return findings
         if purpose in TOOL_REGISTRY:
             tool_func = TOOL_REGISTRY[purpose]
-            print(f"[AGENT LOG] ✓ Executing tool: `{purpose}` with args: {list(parameters.keys())}")
+            log_msg = f"[AGENT LOG] ✓ Executing tool: `{purpose}` with args: {list(parameters.keys())}"
+            logger.info(log_msg)
+            print(log_msg)
             tool_output = None
             try:
                 tool_output = tool_func(**parameters)
                 findings["tool_results"].append({"tool": purpose, "args": parameters, "output": tool_output})
+                logger.info(f"[TOOL RESULT] Output for {purpose}:\n{json.dumps(tool_output, indent=2)}")
                 messages.append({
                     "role": "user",
                     "content": f"TOOL_OUTPUT_FOR_{purpose}: {json.dumps(tool_output)}"
@@ -1097,14 +1267,21 @@ def run_analysis_agent(text_to_analyze: str, report_id: int, file_path: str = No
             except Exception as e:
                 error_msg = f"Tool execution failed for {purpose}: {str(e)}"
                 findings["errors"].append(error_msg)
+                log_msg = f"❌ [TOOL ERROR] {error_msg}"
+                logger.error(log_msg)
+                print(log_msg)
                 messages.append({
                     "role": "user",
                     "content": f"TOOL_EXECUTION_ERROR_FOR_{purpose}: {error_msg}"
                 })
-                print(f"❌ [TOOL ERROR] {error_msg}")
-    findings["final_summary_text"] = f"Investigation stopped: Maximum turns ({MAX_TURNS}) reached without a final summary. Finalizing report with partial findings."
-    print(f"⚠️ [AGENT] Reached maximum turns ({MAX_TURNS})")
+    final_text = f"Investigation stopped: Maximum turns ({MAX_TURNS}) reached without a final summary. Finalizing report with partial findings."
+    findings["final_summary_text"] = final_text
+    log_msg = f"⚠️ [AGENT] Reached maximum turns ({MAX_TURNS})"
+    logger.warning(log_msg)
+    print(log_msg)
     findings['tool_results'] = findings.get('tool_results', [])
+    logger.info(f"END TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("="*55 + "\n")
     return findings
 
 
@@ -1376,18 +1553,6 @@ if os.getenv("GOOGLE_API_KEY") and os.getenv("GOOGLE_API_KEY") != "YOUR_API_KEY_
 openai_client = None
 if os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_API_KEY") != "YOUR_API_KEY_HERE":
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-def extract_artifacts(text: str) -> dict:
-    print(f"\n[TOOL CALLED] Running `extract_artifacts`...")
-    artifacts = {}
-    emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
-    if emails: artifacts["emails"] = list(dict.fromkeys(emails))
-    urls = re.findall(r"http[s]?://[^\s'\"<>]+", text)
-    if urls: artifacts["urls"] = list(dict.fromkeys(urls))
-    ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
-    valid_ips = [ip for ip in ips if all(0 <= int(p) <= 255 for p in ip.split("."))]
-    if valid_ips: artifacts["ips"] = list(dict.fromkeys(valid_ips))
-    print(f"[TOOL RESULT] Found artifacts: {list(artifacts.keys())}")
-    return artifacts
 def inspect_urls(urls: list) -> list:
     print(f"\n[TOOL CALLED] Running `inspect_urls` for {len(urls)} URLs...")
     if not urls or not isinstance(urls, list):
@@ -1452,7 +1617,6 @@ def web_search(query: str) -> dict:
         print(f"[TOOL ERROR] Tavily search failed: {e}")
         return {"error": str(e)}
 TOOL_REGISTRY = {
-    "extract_artifacts": extract_artifacts,
     "inspect_urls": inspect_urls,
     "inspect_ips": inspect_ips,
     "web_search": web_search,
@@ -1465,10 +1629,6 @@ def analyze_evidence(text: str = "", file_path: str = None):
     context = f"## EVIDENCE DESCRIPTION\n{text}\n## EVIDENCE FILE PATH\n{file_path or 'No file provided'}"
     raw_findings = run_analysis_agent(text_to_analyze=context, report_id=0, file_path=file_path)
     initial_artifacts = {}
-    for tool_run in raw_findings.get("tool_results", []):
-        if tool_run.get("tool") == "extract_artifacts":
-            initial_artifacts = tool_run.get("output", {})
-            break
     return {
         "summary": raw_findings.get("final_summary_text", "Analysis complete."),
         "suspect_profile": "AI Generated (See Summary)",
@@ -2101,6 +2261,7 @@ langdetect
 tavily-python
 rq
 google-genai
+piexif
 
 
 
@@ -2298,9 +2459,6 @@ if __name__ == "__main__":
 
 
 
-
-
-
 JusticeAssist/
 ├── combine.js
 ├── public/
@@ -2392,9 +2550,6 @@ JusticeAssist/
 ==================== README.md ====================
 
 <<<<<<< HEAD
-# JusticeAssitance-frontend
-=======
-<<<<<<< HEAD
 # Getting Started with Create React App
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
@@ -2478,7 +2633,6 @@ JusticeAssist is a guided cybercrime reporting and evidence-building platform de
 
 JusticeAssist bridges the gap between technology and law to empower users in taking action against cybercrime.
 >>>>>>> 1c49c99aefa4f7f5795e1f2187f42e6431c36732
->>>>>>> b63839b (the api problem is still there i will resolve it)
 
 
 
